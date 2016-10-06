@@ -11,6 +11,7 @@
     documentation of this module.
 """
 from __future__ import absolute_import
+from contextlib import contextmanager
 
 from trytond import backend
 from trytond.transaction import Transaction
@@ -18,6 +19,20 @@ from trytond.pool import Pool
 from trytond.cache import Cache
 
 from trytond_async.app import app
+
+
+@contextmanager
+def fit_user_company_to_context(user, context):
+    user = Pool().get('res.user')(user)
+    company_bak = user.company
+    main_company_bak = user.main_company
+
+    if 'company' in context:
+        co = context['company']
+        user.write([user], {'company': co, 'main_company': co})
+    yield
+    user.write([user], {'company': company_bak and company_bak.id,
+        'main_company': main_company_bak and company_bak.id})
 
 
 class RetryWithDelay(Exception):
@@ -48,7 +63,7 @@ def _execute(app, database, user, payload_json):
     with Transaction().start(database, 0):
         Cache.clean(database)
 
-    with Transaction().start(database, user) as transaction:
+    with Transaction().start(database, 0) as transaction:
         Async = Pool().get('async.async')
         DatabaseOperationalError = backend.get('DatabaseOperationalError')
 
@@ -56,28 +71,29 @@ def _execute(app, database, user, payload_json):
         # active records are constructed in the same transaction cache and
         # context.
         payload = Async.deserialize_payload(payload_json)
-
-        try:
-            with Transaction().set_context(payload['context']):
-                results = Async.execute_payload(payload)
-        except RetryWithDelay, exc:
-            # A special error that would be raised by Tryton models to
-            # retry the task after a certain delay. Useful when the task
-            # got triggered before the record is ready and similar cases.
-            transaction.cursor.rollback()
-            raise app.retry(exc=exc, countdown=exc.delay)
-        except DatabaseOperationalError, exc:
-            # Strict transaction handling may cause this.
-            # Rollback and Retry the whole transaction if within
-            # max retries, or raise exception and quit.
-            transaction.cursor.rollback()
-            raise app.retry(exc=exc)
-        except Exception, exc:
-            transaction.cursor.rollback()
-            raise
-        else:
-            transaction.cursor.commit()
-            return results
+        with fit_user_company_to_context(user, payload['context']), \
+                Transaction().set_user(user):
+            try:
+                with Transaction().set_context(payload['context']):
+                    results = Async.execute_payload(payload)
+            except RetryWithDelay, exc:
+                # A special error that would be raised by Tryton models to
+                # retry the task after a certain delay. Useful when the task
+                # got triggered before the record is ready and similar cases.
+                transaction.cursor.rollback()
+                raise app.retry(exc=exc, countdown=exc.delay)
+            except DatabaseOperationalError, exc:
+                # Strict transaction handling may cause this.
+                # Rollback and Retry the whole transaction if within
+                # max retries, or raise exception and quit.
+                transaction.cursor.rollback()
+                raise app.retry(exc=exc)
+            except Exception, exc:
+                transaction.cursor.rollback()
+                raise
+            else:
+                transaction.cursor.commit()
+                return results
 
 
 @app.task(bind=True, default_retry_delay=2)
